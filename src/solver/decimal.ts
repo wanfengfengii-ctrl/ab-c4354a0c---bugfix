@@ -89,7 +89,7 @@ export function dCmp(a: Decimal, b: Decimal): -1 | 0 | 1 {
   return d.coef < 0n ? -1 : d.coef > 0n ? 1 : 0;
 }
 
-/** 转为 float64（仅用于展示与决胜余量，不参与安全边界判定）。 */
+/** 转为 float64（仅用于展示，不参与安全边界判定与决胜比较）。 */
 export function dToNumber(d: Decimal): number {
   return Number(`${d.coef}e${d.exp}`);
 }

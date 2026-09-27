@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { adjudicate, EPS } from './adjudicate';
+import { adjudicate } from './adjudicate';
 import type { Scenario } from './types';
+
+/** 断言用浮点容差（仅用于展示数值的近似断言，裁决内部比较均为精确十进制）。 */
+const EPS = 1e-9;
 
 const rails = (...defs: [string, number | string][]): Scenario['rails'] =>
   defs.map(([name, coordinate], i) => ({ id: `rail-${i}`, name, coordinate }));
@@ -326,5 +329,78 @@ describe('adjudicate · 无可行方案的诊断', () => {
     expect(outcome.plan.steps).toHaveLength(4);
     expect(outcome.plan.totalCost).toBeCloseTo(4);
     expect(outcome.plan.steps[3].loadMargin).toBeCloseTo(0);
+  });
+});
+
+describe('adjudicate · 超大十进制力矩余量的精确决胜', () => {
+  it('安全余量严格更高者优先于代价更低者（尾差不得被 float64 吞没）', () => {
+    // S 力臂 10000000000000000（代价 10）：力矩恰为区间中点，余量 10000000000000000；
+    // C 力臂 10000000000000000.025（代价 0）：余量 9999999999999999.975，严格更小，
+    // 但二者在 float64 中均舍入为 1e16。安全余量严格更高的 S 必须胜出，总代价 10。
+    const outcome = adjudicate({
+      rails: rails(['S', '10000000000000000'], ['C', '10000000000000000.025'], ['Z1', 0], ['Z2', 0]),
+      blocks: [
+        block('b0', 1, [[0, 10], [1, 0]]),
+        block('b1', 1, [[2, 0], [3, 0]]),
+        block('b2', 1, [[2, 0], [3, 0]]),
+        block('b3', 1, [[2, 0], [3, 0]]),
+      ],
+      limits: limits(10, '0', '20000000000000000'),
+    });
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    // 完整选项与挂装次序：b0 挂 S，其余配重的零力臂选择完全并列，按录入序号稳定取 Z1。
+    expect(outcome.plan.steps.map((s) => [s.blockIndex, s.railName])).toEqual([
+      [0, 'S'],
+      [1, 'Z1'],
+      [2, 'Z1'],
+      [3, 'Z1'],
+    ]);
+    expect(outcome.plan.totalCost).toBeCloseTo(10);
+    expect(outcome.plan.minTorqueMargin).toBe(10000000000000000);
+    expect(outcome.plan.finalTorque).toBe(10000000000000000);
+    expect(outcome.plan.finalMass).toBeCloseTo(4);
+  });
+
+  it('超大十进制力矩余量确实相等时，总代价才参与决胜', () => {
+    // S 力臂 10000000000000000.025（代价 5）与 C 力臂 9999999999999999.975（代价 3）
+    // 对区间 [0, 20000000000000000] 的余量都精确等于 9999999999999999.975，
+    // 此时才由总代价决胜：C（总代价 3）胜出。
+    const outcome = adjudicate({
+      rails: rails(['S', '10000000000000000.025'], ['C', '9999999999999999.975'], ['Z1', 0], ['Z2', 0]),
+      blocks: [
+        block('b0', 1, [[0, 5], [1, 3]]),
+        block('b1', 1, [[2, 0], [3, 0]]),
+        block('b2', 1, [[2, 0], [3, 0]]),
+        block('b3', 1, [[2, 0], [3, 0]]),
+      ],
+      limits: limits(10, '0', '20000000000000000'),
+    });
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    expect(outcome.plan.steps.map((s) => [s.blockIndex, s.railName])).toEqual([
+      [0, 'C'],
+      [1, 'Z1'],
+      [2, 'Z1'],
+      [3, 'Z1'],
+    ]);
+    expect(outcome.plan.totalCost).toBeCloseTo(3);
+  });
+
+  it('力矩恰好触及闭区间端点仍判可行（闭区间边界不变）', () => {
+    // 首步力矩恰为端点 -2（余量 0，闭区间下可行），次步回到 0。
+    const outcome = adjudicate({
+      rails: rails(['L', -2], ['R', 2]),
+      blocks: [block('b1', 1, [[0, 1], [1, 1]]), block('b2', 1, [[0, 1], [1, 1]])],
+      limits: limits(10, -2, 2),
+    });
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    expect(outcome.plan.minTorqueMargin).toBeCloseTo(0);
+    expect(outcome.plan.steps.map((s) => [s.blockIndex, s.railName])).toEqual([
+      [0, 'L'],
+      [1, 'R'],
+    ]);
+    expect(outcome.plan.steps[0].cumulativeTorque).toBe(-2);
   });
 });
