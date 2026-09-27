@@ -149,6 +149,48 @@ if (!r4.feasible) {
   );
 }
 
+// 超大十进制力矩余量决胜：S 力臂 10000000000000000（代价 10），C 力臂
+// 10000000000000000.025（代价 0）。b0@S 的余量恰为 10000000000000000，b0@C 的余量
+// 恰为 9999999999999999.975；float64 会吞掉 0.025 尾差把两者误判并列，让代价 0 的 C
+// 胜出。按精确十进制，安全余量严格更高的 b0@S 必须以总代价 10 胜出。
+const hugeTorqueMarginScenario: Scenario = {
+  rails: [
+    { id: 'S', name: 'S', coordinate: '10000000000000000' },
+    { id: 'C', name: 'C', coordinate: '10000000000000000.025' },
+    { id: 'Z1', name: 'Z1', coordinate: 0 },
+    { id: 'Z2', name: 'Z2', coordinate: 0 },
+  ],
+  blocks: [
+    { id: 'b0', name: 'b0', mass: 1, options: [{ railId: 'S', cost: 10 }, { railId: 'C', cost: 0 }] },
+    ...[1, 2, 3].map((i) => ({
+      id: `b${i}`,
+      name: `b${i}`,
+      mass: 1,
+      options: [
+        { railId: 'Z1', cost: 0 },
+        { railId: 'Z2', cost: 0 },
+      ],
+    })),
+  ],
+  limits: { maxLoad: 10, minTorque: 0, maxTorque: '20000000000000000' },
+};
+
+const r5 = adjudicate(hugeTorqueMarginScenario);
+check(r5.feasible, '裁决模块：超大十进制力矩余量场景应判定为可行');
+if (r5.feasible) {
+  check(
+    r5.plan.steps.map((s) => `${s.blockName}@${s.railName}`).join(',') === 'b0@S,b1@Z1,b2@Z1,b3@Z1',
+    `裁决模块：超大力矩场景应选安全余量严格更高的 b0@S（实际 ${r5.plan.steps
+      .map((s) => `${s.blockName}@${s.railName}`)
+      .join(',')}）`,
+  );
+  check(r5.plan.totalCost === 10, `裁决模块：超大力矩场景总代价应为 10（实际 ${r5.plan.totalCost}）`);
+  check(
+    r5.plan.minTorqueMargin === 1e16 && r5.plan.finalTorque === 1e16 && r5.plan.finalMass === 4,
+    '裁决模块：超大力矩场景的最小余量 / 最终力矩 / 最终载荷应为 1e16 / 1e16 / 4',
+  );
+}
+
 // ---------- 2. 已启动页面健康端点冒烟 ----------
 
 const deadline = Date.now() + 60_000;

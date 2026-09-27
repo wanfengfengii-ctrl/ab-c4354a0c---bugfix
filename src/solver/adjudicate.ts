@@ -9,15 +9,16 @@ import type {
   ViolationKind,
 } from './types';
 
-/** 决胜比较容差：力矩余量的并列判定使用。 */
-export const EPS = 1e-9;
-
 /**
- * 安全边界（总载荷 / 力矩闭区间）判定使用精确十进制比较：
+ * 安全边界（总载荷 / 力矩闭区间）判定与力矩余量决胜均使用精确十进制比较：
  * 按录入的十进制值累加与相乘（bigint 定点，无舍入），恰好触及边界的
  * 方案仍判可行，而任何真实超限——包括整数部分超过 2^53 后 float64
  * 无法表示的小数超出量（例如总载荷 10000000000000000.1 对上限
  * 10000000000000000）——都必须判不可行。
+ *
+ * 决胜比较同样不设浮点容差：力矩余量 10000000000000000 与
+ * 9999999999999999.975 在 float64 中同为 1e16，但前者严格更大、必须胜出；
+ * 只有余量精确相等时总代价才参与决胜，仍相等再按录入序号字典序决胜。
  */
 
 interface FlatOption {
@@ -40,16 +41,11 @@ interface FlatBlock {
   options: FlatOption[];
 }
 
-/** 两个精确十进制值之间的距离（float64 视图）；恰好相等时精确归零。 */
-function distanceNumber(a: Decimal, b: Decimal): number {
-  const c = dCmp(a, b);
-  if (c === 0) return 0;
-  return dToNumber(c > 0 ? dSub(a, b) : dSub(b, a));
-}
-
-/** 某前缀的力矩余量 = 力矩到闭区间两端的最短距离。 */
-function torqueMarginOf(torque: Decimal, min: Decimal, max: Decimal): number {
-  return Math.min(distanceNumber(torque, min), distanceNumber(torque, max));
+/** 某前缀的力矩余量（精确十进制）= 力矩到闭区间两端的最短距离。 */
+function torqueMarginDecOf(torque: Decimal, min: Decimal, max: Decimal): Decimal {
+  const low = dSub(torque, min);
+  const high = dSub(max, torque);
+  return dCmp(low, high) <= 0 ? low : high;
 }
 
 /** 按 (块录入序号, 位置录入序号) 沿挂装次序逐位比较，保证稳定决胜。 */
@@ -62,24 +58,36 @@ function lexCompareSteps(a: StepRecord[], b: StepRecord[]): number {
   return a.length - b.length;
 }
 
+/** 一套候选（完整方案或可行前缀）及其精确决胜键。 */
+interface Incumbent {
+  plan: Plan;
+  /** 总安装代价（按全场景公共定点折算的大整数）。 */
+  cost: bigint;
+  /** 最小力矩余量（精确十进制）；空前缀为 null，视为 +∞。 */
+  marginDec: Decimal | null;
+}
+
+/** 余量的精确比较：null 表示空前缀的 +∞。 */
+function cmpMargin(a: Decimal | null, b: Decimal | null): number {
+  if (a === null) return b === null ? 0 : 1;
+  if (b === null) return -1;
+  return dCmp(a, b);
+}
+
 /**
  * 裁决优先级（依次）：
- * 1. 力矩余量（所有前缀中的最小值）最大者优先；
- * 2. 总安装代价最小者优先（按精确十进制比较，无浮点噪声）；
+ * 1. 力矩余量（所有前缀中的最小值）最大者优先——精确十进制比较，无容差；
+ * 2. 总安装代价最小者优先（按公共定点大整数比较，无浮点噪声）；
  * 3. 按挂装顺序的 (块录入序号, 位置录入序号) 序列字典序最小者优先。
  */
-function isBetter(
-  a: Plan,
-  aCost: bigint,
-  b: Plan | null,
-  bCost: bigint | null,
-): boolean {
-  if (b === null || bCost === null) return true;
-  if (a.minTorqueMargin > b.minTorqueMargin + EPS) return true;
-  if (a.minTorqueMargin < b.minTorqueMargin - EPS) return false;
-  if (aCost < bCost) return true;
-  if (aCost > bCost) return false;
-  return lexCompareSteps(a.steps, b.steps) < 0;
+function isBetter(a: Incumbent, b: Incumbent | null): boolean {
+  if (b === null) return true;
+  const marginCmp = cmpMargin(a.marginDec, b.marginDec);
+  if (marginCmp > 0) return true;
+  if (marginCmp < 0) return false;
+  if (a.cost < b.cost) return true;
+  if (a.cost > b.cost) return false;
+  return lexCompareSteps(a.plan.steps, b.plan.steps) < 0;
 }
 
 /** 卷扬轴限制的精确十进制视图。 */
@@ -143,11 +151,11 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
 
   const used = new Array<boolean>(n).fill(false);
   const steps: StepRecord[] = [];
-  let best: Plan | null = null;
-  let bestCost: bigint | null = null;
-  /** 每个深度上按裁决优先级最优的可行前缀（用于无可行方案时的诊断）。 */
-  const bestPartial: (Plan | null)[] = new Array(n + 1).fill(null);
-  const bestPartialCost: (bigint | null)[] = new Array(n + 1).fill(null);
+  /**
+   * 每个深度上按裁决优先级最优的可行前缀（用于无可行方案时的诊断）；
+   * 深度 n 处即当前最优的完整方案。
+   */
+  const bestPartial: (Incumbent | null)[] = new Array(n + 1).fill(null);
 
   const snapshot = (totalCost: number, minTorqueMargin: number): Plan => ({
     steps: steps.map((s) => ({ ...s })),
@@ -157,19 +165,18 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
     finalTorque: steps.length > 0 ? steps[steps.length - 1].cumulativeTorque : 0,
   });
 
-  const dfs = (depth: number, mass: Decimal, torque: Decimal, cost: bigint, costNum: number, minMargin: number): void => {
-    const current = snapshot(costNum, minMargin);
-    if (isBetter(current, cost, bestPartial[depth], bestPartialCost[depth])) {
-      bestPartial[depth] = current;
-      bestPartialCost[depth] = cost;
-    }
-    if (depth === n) {
-      if (isBetter(current, cost, best, bestCost)) {
-        best = current;
-        bestCost = cost;
-      }
-      return;
-    }
+  const dfs = (
+    depth: number,
+    mass: Decimal,
+    torque: Decimal,
+    cost: bigint,
+    costNum: number,
+    minMarginNum: number,
+    minMarginDec: Decimal | null,
+  ): void => {
+    const current: Incumbent = { plan: snapshot(costNum, minMarginNum), cost, marginDec: minMarginDec };
+    if (isBetter(current, bestPartial[depth])) bestPartial[depth] = current;
+    if (depth === n) return;
     for (let i = 0; i < n; i++) {
       if (used[i]) continue;
       const block = blocks[i];
@@ -180,15 +187,19 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
         if (dCmp(torqueAfter, lim.minTorque) < 0 || dCmp(torqueAfter, lim.maxTorque) > 0) {
           continue;
         }
-        const margin = torqueMarginOf(torqueAfter, lim.minTorque, lim.maxTorque);
-        const nextMinMargin = Math.min(minMargin, margin);
+        const marginDec = torqueMarginDecOf(torqueAfter, lim.minTorque, lim.maxTorque);
+        const nextMinMarginDec =
+          minMarginDec !== null && dCmp(minMarginDec, marginDec) <= 0 ? minMarginDec : marginDec;
+        const nextMinMarginNum = Math.min(minMarginNum, dToNumber(marginDec));
         const nextCost = cost + opt.costScaled;
         const nextCostNum = costNum + opt.cost;
-        if (best && bestCost !== null) {
-          // 力矩余量已严格劣于最优解，剪枝。
-          if (nextMinMargin < best.minTorqueMargin - EPS) continue;
-          // 余量无法严格更优且代价已严格更差，剪枝。
-          if (nextMinMargin < best.minTorqueMargin + EPS && nextCost > bestCost) continue;
+        const incumbent = bestPartial[n];
+        if (incumbent) {
+          // 力矩余量沿前缀单调不增：已严格劣于最优解时无法翻盘，剪枝。
+          const marginCmp = cmpMargin(nextMinMarginDec, incumbent.marginDec);
+          if (marginCmp < 0) continue;
+          // 余量至多并列，且总代价（单调不减）已严格更差，剪枝。
+          if (marginCmp === 0 && nextCost > incumbent.cost) continue;
         }
         used[i] = true;
         steps.push({
@@ -203,24 +214,25 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
           cumulativeMass: dToNumber(massAfter),
           cumulativeTorque: dToNumber(torqueAfter),
           loadMargin: dToNumber(dSub(lim.maxLoad, massAfter)),
-          torqueMargin: margin,
+          torqueMargin: dToNumber(marginDec),
         });
-        dfs(depth + 1, massAfter, torqueAfter, nextCost, nextCostNum, nextMinMargin);
+        dfs(depth + 1, massAfter, torqueAfter, nextCost, nextCostNum, nextMinMarginNum, nextMinMarginDec);
         steps.pop();
         used[i] = false;
       }
     }
   };
 
-  dfs(0, decimalFrom(0), decimalFrom(0), 0n, 0, Number.POSITIVE_INFINITY);
+  dfs(0, decimalFrom(0), decimalFrom(0), 0n, 0, Number.POSITIVE_INFINITY, null);
 
-  if (best) return { feasible: true, plan: best };
+  const best = bestPartial[n];
+  if (best) return { feasible: true, plan: best.plan };
 
   // 无可行方案：定位最深的可行已选前缀（其下一步即最早无法继续挂装的位置）。
   let depth = n - 1;
   while (depth >= 0 && bestPartial[depth] === null) depth--;
   const witness = depth >= 0 ? bestPartial[depth] : null;
-  const witnessSteps = witness ? witness.steps : [];
+  const witnessSteps = witness ? witness.plan.steps : [];
   const usedBlocks = new Set(witnessSteps.map((s) => s.blockIndex));
   // 由见证前缀的每步增量恢复精确十进制状态，保证超限判定同样按录入十进制值进行。
   const baseMass = witnessSteps.reduce<Decimal>((acc, s) => dAdd(acc, blocks[s.blockIndex].massDec), decimalFrom(0));
